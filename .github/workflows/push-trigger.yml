@@ -1,0 +1,256 @@
+name: Maven Package upon a push
+
+on:
+  release:
+    types: [published]
+  pull_request:
+    types: [opened, reopened, synchronize]
+  workflow_dispatch:
+    inputs:
+      message:
+        description: 'Message for manually triggering'
+        required: false
+        default: 'Triggered for Updates'
+        type: string
+  push:
+    branches:
+      - '!release-branch'
+      - master
+      - 1.*
+      - develop
+      - MOSIP*
+      - release*
+      - INJICERT-*
+
+jobs:
+  build-maven-inji-certify:
+    uses: mosip/kattu/.github/workflows/maven-build.yml@master-java21
+    with:
+      SERVICE_LOCATION: ./
+      BUILD_ARTIFACT: inji-certify
+    secrets:
+      OSSRH_USER: ${{ secrets.OSSRH_USER }}
+      OSSRH_SECRET: ${{ secrets.OSSRH_SECRET }}
+      OSSRH_TOKEN: ${{ secrets.OSSRH_TOKEN }}
+      GPG_SECRET: ${{ secrets.GPG_SECRET }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+  publish_to_nexus:
+    if: "${{ !contains(github.ref, 'master') && github.event_name != 'pull_request' }}"
+    needs: build-maven-inji-certify
+    uses: mosip/kattu/.github/workflows/maven-publish-to-nexus.yml@master-java21
+    with:
+      SERVICE_LOCATION: ./
+    secrets:
+      OSSRH_USER: ${{ secrets.OSSRH_USER }}
+      OSSRH_SECRET: ${{ secrets.OSSRH_SECRET }}
+      OSSRH_URL: ${{ secrets.OSSRH_SNAPSHOT_URL }}
+      OSSRH_TOKEN: ${{ secrets.OSSRH_TOKEN }}
+      GPG_SECRET: ${{ secrets.GPG_SECRET }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+
+  build-dockers:
+    needs: build-maven-inji-certify
+    strategy:
+      matrix:
+        include:
+          - SERVICE_LOCATION: 'certify-service'
+            SERVICE_NAME: 'inji-certify'
+            BUILD_ARTIFACT: 'inji-certify'
+            SQUASH_LAYERS: '15'
+      fail-fast: false
+    name: ${{ matrix.SERVICE_NAME }}
+    uses: mosip/kattu/.github/workflows/docker-build.yml@master-java21
+    with:
+      SERVICE_LOCATION: ${{ matrix.SERVICE_LOCATION }}
+      SERVICE_NAME: ${{ matrix.SERVICE_NAME }}
+      BUILD_ARTIFACT: ${{ matrix.BUILD_ARTIFACT }}
+      SQUASH_LAYERS: ${{ matrix.SQUASH_LAYERS }}
+    secrets:
+      DEV_NAMESPACE_DOCKER_HUB: ${{ secrets.DEV_NAMESPACE_DOCKER_HUB }}
+      ACTOR_DOCKER_HUB: ${{ secrets.ACTOR_DOCKER_HUB }}
+      RELEASE_DOCKER_HUB: ${{ secrets.RELEASE_DOCKER_HUB }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+  build-inji-certify-with-plugins:
+    needs: [ build-dockers ]
+    runs-on: ubuntu-latest
+    env:
+      NAMESPACE: ${{ secrets.dev_namespace_docker_hub }}
+      SERVICE_LOCATION: ./certify-service-with-plugins
+      BUILD_ARTIFACT: inji-certify-with-plugins
+      SERVICE_NAME: inji-certify-with-plugins
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up JDK 21
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: 21
+          server-id: ossrh # Value of the distributionManagement/repository/id field of the pom.xml
+          settings-path: ${{ github.workspace }} # location for the settings.xml file
+      - name: Setup the settings file for ossrh server
+        run: echo "<settings> <servers>  <server>  <id>ossrh</id>    <username>${{secrets.ossrh_user}}</username> <password>${{secrets.ossrh_secret}}</password> </server> </servers> <profiles> <profile>     <id>ossrh</id> <activation> <activeByDefault>true</activeByDefault> </activation>  <properties> <gpg.executable>gpg2</gpg.executable> <gpg.passphrase>${{secrets.gpg_secret}}</gpg.passphrase> </properties> </profile> <profile> <id>allow-snapshots</id>       <activation><activeByDefault>true</activeByDefault></activation> <repositories> <repository>        <id>snapshots-repo</id> <url>https://oss.sonatype.org/content/repositories/snapshots</url> <releases><enabled>false</enabled></releases> <snapshots><enabled>true</enabled></snapshots> </repository>  <repository>         <id>releases-repo</id>  <url>https://oss.sonatype.org/service/local/staging/deploy/maven2</url>         <releases><enabled>true</enabled></releases>         <snapshots><enabled>false</enabled></snapshots> </repository> </repositories>  </profile> <profile> <id>sonar</id> <properties>  <sonar.sources>.</sonar.sources> <sonar.host.url>https://sonarcloud.io</sonar.host.url>  </properties> <activation> <activeByDefault>false</activeByDefault> </activation> </profile> </profiles> </settings>" > $GITHUB_WORKSPACE/settings.xml
+      - name: Build Certify with plugin with Maven
+        run: |
+          cd ${{ env.SERVICE_LOCATION}}
+          mvn clean package -s $GITHUB_WORKSPACE/settings.xml
+      - name: Build check for Docker label
+        run: |
+          cd ${{ env.SERVICE_LOCATION }}
+          for layer in  ARG\\s+SOURCE ARG\\s+COMMIT_HASH ARG\\s+COMMIT_ID ARG\\s+BUILD_TIME LABEL\\s+source=\\$\\{SOURCE\\} LABEL\\s+commit_hash=\\$\\{COMMIT_HASH\\} LABEL\\s+commit_id=\\$\\{COMMIT_ID\\} LABEL\\s+build_time=\\$\\{BUILD_TIME\\}; do
+            layer_count=$( grep -Ev '^$' Dockerfile | grep -Ec "$layer" || true);
+
+            if [[ $layer_count -ne 1 ]]; then
+              dlayer=$( echo $layer | sed -E 's/\\s\+/ /g' | sed -E 's/\\//g' )
+              echo "Docker layer : \"$dlayer\" not found; EXITING";
+              exit 1;
+            fi
+          done
+
+      - name: Setup branch and env
+        run: |
+          # Strip git ref prefix from version
+          echo "BRANCH_NAME=$(echo ${{ github.ref }} | sed -e 's,.*/\(.*\),\1,')" >> $GITHUB_ENV
+          echo "GPG_TTY=$(tty)" >> $GITHUB_ENV
+          echo "${{ toJSON(inputs) }}"
+
+      - name: Build image
+        run: |
+          cd ${{ env.SERVICE_LOCATION }}
+          docker build . --build-arg SOURCE=mosip --build-arg COMMIT_HASH=$(git rev-parse HEAD) --build-arg COMMIT_ID=$(git rev-parse --short HEAD) --build-arg BUILD_TIME=$BUILD_TIME --file Dockerfile --tag ${{ env.SERVICE_NAME }}
+
+      - name: Log into registry
+        if: "${{ github.event_name != 'pull_request' }}"
+        run: echo "${{secrets.RELEASE_DOCKER_HUB}}" | docker login -u ${{secrets.ACTOR_DOCKER_HUB}} --password-stdin
+
+      - name: Push image
+        if: "${{ github.event_name != 'pull_request' }}"
+        run: |
+          IMAGE_ID=$NAMESPACE/$SERVICE_NAME
+
+          # Change all uppercase to lowercase
+          IMAGE_ID=$(echo $IMAGE_ID | tr '[A-Z]' '[a-z]')
+          echo "push version ${{steps.getPomVersion.outputs.info}}"
+          if [[ $BRANCH_NAME == master ]]; then
+          VERSION=latest
+          else
+          VERSION=$BRANCH_NAME
+          fi
+          echo IMAGE_ID=$IMAGE_ID
+          echo VERSION=$VERSION
+          docker tag $SERVICE_NAME $IMAGE_ID:$VERSION
+          docker push $IMAGE_ID:$VERSION
+
+
+  sonar_analysis:
+    needs: build-maven-inji-certify
+    if: "${{  github.event_name != 'pull_request' }}"
+    uses: mosip/kattu/.github/workflows/maven-sonar-analysis.yml@master-java21
+    with:
+      SERVICE_LOCATION: ./
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      ORG_KEY: ${{ secrets.ORG_KEY }}
+      OSSRH_USER: ${{ secrets.OSSRH_USER }}
+      OSSRH_SECRET: ${{ secrets.OSSRH_SECRET }}
+      OSSRH_TOKEN: ${{ secrets.OSSRH_TOKEN }}
+      GPG_SECRET: ${{ secrets.GPG_SECRET }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+  build-maven-apitest-inji-certify:
+    uses: mosip/kattu/.github/workflows/maven-build.yml@master-java21
+    with:
+      SERVICE_LOCATION: ./api-test
+      BUILD_ARTIFACT: apitest-inji-certify
+    secrets:
+      OSSRH_USER: ${{ secrets.OSSRH_USER }}
+      OSSRH_SECRET: ${{ secrets.OSSRH_SECRET }}
+      OSSRH_TOKEN: ${{ secrets.OSSRH_TOKEN }}
+      GPG_SECRET: ${{ secrets.GPG_SECRET }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+  publish_to_nexus_apitest_inji_certify:
+    if: "${{ !contains(github.ref, 'master') && github.event_name != 'pull_request' && github.event_name != 'release' && github.event_name != 'prerelease' && github.event_name != 'publish' }}"
+    needs: build-maven-apitest-inji-certify
+    uses: mosip/kattu/.github/workflows/maven-publish-to-nexus.yml@master-java21
+    with:
+      SERVICE_LOCATION: ./api-test
+    secrets:
+      OSSRH_USER: ${{ secrets.OSSRH_USER }}
+      OSSRH_SECRET: ${{ secrets.OSSRH_SECRET }}
+      OSSRH_URL: ${{ secrets.OSSRH_SNAPSHOT_URL }}
+      OSSRH_TOKEN: ${{ secrets.OSSRH_TOKEN }}
+      GPG_SECRET: ${{ secrets.GPG_SECRET }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+  build-apitest-inji-certify-local:
+    needs: build-maven-apitest-inji-certify
+    runs-on: ubuntu-latest
+    env:
+      NAMESPACE: ${{ secrets.dev_namespace_docker_hub }}
+      SERVICE_NAME: apitest-inji-certify
+      SERVICE_LOCATION: api-test
+      BUILD_ARTIFACT: apitest-inji-certify-local
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up JDK 21
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: 21
+          server-id: ossrh # Value of the distributionManagement/repository/id field of the pom.xml
+          settings-path: ${{ github.workspace }} # location for the settings.xml file
+      - name: Setup the settings file for ossrh server
+        run: echo "<settings> <servers>  <server>  <id>ossrh</id>    <username>${{secrets.ossrh_user}}</username> <password>${{secrets.ossrh_secret}}</password> </server> </servers> <profiles> <profile>     <id>ossrh</id> <activation> <activeByDefault>true</activeByDefault> </activation>  <properties> <gpg.executable>gpg2</gpg.executable> <gpg.passphrase>${{secrets.gpg_secret}}</gpg.passphrase> </properties> </profile> <profile> <id>allow-snapshots</id>       <activation><activeByDefault>true</activeByDefault></activation> <repositories> <repository>        <id>snapshots-repo</id> <url>https://oss.sonatype.org/content/repositories/snapshots</url> <releases><enabled>false</enabled></releases> <snapshots><enabled>true</enabled></snapshots> </repository>  <repository>         <id>releases-repo</id>  <url>https://oss.sonatype.org/service/local/staging/deploy/maven2</url>         <releases><enabled>true</enabled></releases>         <snapshots><enabled>false</enabled></snapshots> </repository> </repositories>  </profile> <profile> <id>sonar</id> <properties>  <sonar.sources>.</sonar.sources> <sonar.host.url>https://sonarcloud.io</sonar.host.url>  </properties> <activation> <activeByDefault>false</activeByDefault> </activation> </profile> </profiles> </settings>" > $GITHUB_WORKSPACE/settings.xml
+      - name: Build Automationtests with Maven
+        run: |
+          cd ${{ env.SERVICE_LOCATION}}
+          mvn clean package -s $GITHUB_WORKSPACE/settings.xml
+      - name: Copy configuration files to target directory.
+        run: |
+          cp -r ${{ env.SERVICE_LOCATION}}/target/classes/config ${{ env.SERVICE_LOCATION}}/target/config
+          cp -r ${{ env.SERVICE_LOCATION}}/testNgXmlFiles ${{ env.SERVICE_LOCATION}}/target/testNgXmlFiles
+      - name: Ready the springboot artifacts
+        if: ${{ !contains(github.ref, 'master') || !contains(github.ref, 'main') }}
+        run: |
+          ## FIND JARS & COPY ONLY EXECUTABLE JARs STORED UNDER TARGET DIRECTORY 
+          find ${{ env.SERVICE_LOCATION }} -path '*/target/*' -exec zip ${{ env.BUILD_ARTIFACT }}.zip {} +
+      - name: Upload the springboot jars
+        if: ${{ !contains(github.ref, 'master') || !contains(github.ref, 'main') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BUILD_ARTIFACT }}
+          path: ${{ env.BUILD_ARTIFACT }}.zip
+      - uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          fields: repo,message,author,commit,workflow,job # selectable (default: repo,message)
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }} # required
+        if: failure() # Pick up events even if the job fails or is canceled.
+
+  build-dockers_apitest_inji_certify:
+    needs: build-apitest-inji-certify-local
+    strategy:
+      matrix:
+        include:
+          - SERVICE_LOCATION: 'api-test'
+            SERVICE_NAME: 'apitest-inji-certify'
+            BUILD_ARTIFACT: 'apitest-inji-certify-local'
+            ONLY_DOCKER: true
+      fail-fast: false
+    name: ${{ matrix.SERVICE_NAME }}
+    uses: mosip/kattu/.github/workflows/docker-build.yml@master-java21
+    with:
+      SERVICE_LOCATION: ${{ matrix.SERVICE_LOCATION }}
+      SERVICE_NAME: ${{ matrix.SERVICE_NAME }}
+      BUILD_ARTIFACT: ${{ matrix.BUILD_ARTIFACT }}
+      ONLY_DOCKER: ${{ matrix.ONLY_DOCKER }}
+    secrets:
+      DEV_NAMESPACE_DOCKER_HUB: ${{ secrets.DEV_NAMESPACE_DOCKER_HUB }}
+      ACTOR_DOCKER_HUB: ${{ secrets.ACTOR_DOCKER_HUB }}
+      RELEASE_DOCKER_HUB: ${{ secrets.RELEASE_DOCKER_HUB }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
